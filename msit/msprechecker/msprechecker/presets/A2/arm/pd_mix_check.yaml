@@ -1,0 +1,115 @@
+mies_config:
+  ServerConfig:
+    tokenTimeout:
+      expected:
+        type: eq
+        value: 600
+      reason: "tokenTimeout建议值为600，表示每token的超时时间，在测试推理性能时可以适当增大，不超过3600"
+      severity: low
+    e2eTimeout:
+      expected:
+        type: eq
+        value: 600
+      reason: "e2eTimeout建议值为600，表示端到端推理的超时时间，在测试推理性能时可以适当增大，不超过65535"
+      severity: low
+    httpsEnabled:
+      expected:
+        type: eq
+        value: false
+      reason: "如果确实配置了安全证书，建议开启为true，此条校验为提示"
+      severity: low
+    inferMode:
+      expected:
+        type: eq
+        value: "'Standard'"
+      reason: "PD混部场景下，inferMode应该是standard"
+      severity: high
+    interCommTLSEnabled:
+      expected:
+        type: eq
+        value: false
+      reason: "如果确实配置了安全证书，建议开启为true，此条校验为提示"
+      severity: low
+  BackendConfig:
+    multiNodesInferEnabled:
+      expected:
+        type: eq
+        value: false
+      reason: "multiNodesInferEnabled表示服务跨机推理，非DeepSeek模型场景不支持"
+      severity: high
+    ModelDeployConfig:
+      maxSeqLen:
+        expected:
+          type: ">="
+          value: ${BackendConfig.ModelDeployConfig.maxInputTokenLen}
+        reason: "maxSeqLen不应该小于maxInputTokenLen，表示输入token加输出token的上限"
+        severity: high
+      maxInputTokenLen:
+        expected:
+          type: ">="
+          value: 1
+        reason: "maxInputTokenLen应该大于等于1，表示输入token的上限"
+        severity: high
+      ModelConfig[0]:
+        modelWeightPath:
+          expected:
+            case:
+              type: path
+              value: "'exists'"
+            reason: "modelWeightPath需要配置为当前容器中挂载的模型权重路径"
+            severity: high
+        worldSize:
+          expected:
+            type: range
+            value: [1, 8]
+          reason: "Atlas 800I A2服务器上，单机PD分离场景下，worldSize取值范围为1到8"
+          severity: high
+        ignore_eos:
+          expected:
+            type: eq
+            value: false
+          reason: "ignore_eos表示是否忽略eos token，测试固定长度输出时可以设置为true"
+          severity: low
+    ScheduleConfig:
+      maxPrefillBatchSize:
+        expected:
+          type: ">="
+          value: 1
+        reason: "表示prefill的最大batch size，不能小于1"
+        severity: high
+      maxPrefillTokens:
+        expected:
+          type: ">="
+          value: ${BackendConfig.ModelDeployConfig.maxInputTokenLen}
+        reason: "maxPrefillTokens需要设置大于maxInputTokenLen，表示prefill最大token数"
+        severity: high
+      maxIterTimes:
+        expected:
+          type: range
+          value: [1, "${BackendConfig.ModelDeployConfig.maxSeqLen}"]
+        reason: "maxIterTimes应该大于等于1小于等于maxSeqLen"
+        severity: high
+
+env:
+  MINDIE_LOG_TO_FILE:
+    expected:
+      type: eq
+      value: "'1'"
+    reason: "建议将MindIE日志写入文件，便于排查问题"
+    severity: low
+  MINDIE_LOG_TO_STDOUT:
+    expected:
+      type: eq
+      value: "'1'"
+    reason: "建议将MindIE日志打屏，便于通过查看k8s日志查看程序运行状态"
+    severity: low
+  MINDIE_LOG_LEVEL:
+    expected:
+      if: "${.} != None"
+      then:
+        case:
+          type: enum
+          value: ["'1'", "'INFO'"]
+        reason: "如果配置了MINDIE_LOG_LEVEL，建议设置为1或INFO，表示日志级别为info"
+        severity: low
+  

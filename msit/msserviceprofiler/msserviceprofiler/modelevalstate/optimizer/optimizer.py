@@ -1,0 +1,510 @@
+# -*- coding: utf-8 -*-
+# Copyright (c) 2025-2025 Huawei Technologies Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import argparse
+import atexit
+import os
+from copy import deepcopy
+from math import inf, isinf, isnan
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+from loguru import logger
+
+from msserviceprofiler.modelevalstate.common import is_vllm, is_mindie
+from msserviceprofiler.modelevalstate.config.config import (
+    MindieConfig, settings, map_param_with_value, field_to_param,
+    default_support_field, PsoOptions, PerformanceIndex
+)
+from msserviceprofiler.modelevalstate.config.base_config import (
+    EnginePolicy, DeployPolicy, AnalyzeTool,
+    ServiceType, BenchMarkPolicy, PDPolicy
+)
+from msserviceprofiler.modelevalstate.config.model_config import MindieModelConfig
+from msserviceprofiler.modelevalstate.optimizer.benchmark import BenchMark, VllmBenchMark, ProfilerBenchmark, AisBench
+from msserviceprofiler.modelevalstate.optimizer.experience_fine_tunning import MindIeFineTune, StopFineTune
+from msserviceprofiler.modelevalstate.optimizer.performance_tunner import PerformanceTuner
+from msserviceprofiler.modelevalstate.optimizer.scheduler import Scheduler, ScheduleWithMultiMachine
+from msserviceprofiler.modelevalstate.optimizer.utils import kill_process, get_required_field_from_json
+from msserviceprofiler.modelevalstate.optimizer.simulator import Simulator, VllmSimulator, enable_simulate, \
+    DisaggregationSimulator
+
+
+MAX_ITER_NUM = 200
+
+
+@atexit.register
+def clearing_residual_process():
+    kill_process(MindieConfig().process_name)
+
+
+class PSOOptimizer(PerformanceTuner):
+    def __init__(self, scheduler: Scheduler, n_particles: int = 10, iters=100, pso_options: PsoOptions = None,
+                 target_field: Optional[Tuple] = None, load_history_data: Optional[List] = None,
+                 load_breakpoint: bool = False, pso_init_kwargs: Optional[Dict] = None,
+                 mindie_fine_tune: MindIeFineTune = None, max_fine_tune: int = 10, **kwargs):
+        super().__init__(**kwargs)
+        self.scheduler = scheduler
+        self.n_particles = min(n_particles, MAX_ITER_NUM)
+        self.iters = min(iters, MAX_ITER_NUM)
+        self.target_field = target_field if target_field else default_support_field
+        if not pso_options:
+            self.pso_options = PsoOptions()
+        else:
+            self.pso_options = pso_options
+        self.load_history_data = load_history_data
+        self.load_breakpoint = load_breakpoint
+        self.pso_init_kwargs = pso_init_kwargs
+        self.init_pos = None
+        self.history_cost, self.history_pos = None, None
+        self.default_fitness = None
+        self.default_run_param = None
+        self.default_res = None
+        self.sample_data = None
+        self.mindie_fine_tune = mindie_fine_tune
+        self.max_fine_tune = min(max_fine_tune, MAX_ITER_NUM)
+
+    @staticmethod
+    def is_within_boundary(target_pos, min_bound, max_bound):
+        # 检查数据是否再边界内
+        for i, v in enumerate(target_pos):
+            if min_bound[i] <= v <= max_bound[i]:
+                continue
+            else:
+                return False
+        return True
+
+    @staticmethod
+    def params_in_records(params, record_params):
+        for _his_params in record_params:
+            if (_his_params == params).all():
+                return True
+        return False
+
+    def get_target_field_from_case_data(self, case_data):
+        # 有空数据的都视为无效数据跳过。
+        _target_field = deepcopy(self.target_field)
+        for _field in _target_field:
+            _case_value = case_data.get(_field.name, None)
+            if _case_value is None:
+                raise ValueError("Invalid data.")
+            _field.value = _case_value
+        return _target_field
+
+    def computer_fitness(self) -> Tuple:
+        all_position = []
+        all_cost = []
+        _min_bound, _max_bound = self.constructing_bounds()
+        for case_data in self.load_history_data:
+            _fitness = case_data.get("fitness")
+            # 不存在fit ness，则重新计算
+            if not _fitness:
+                _params = {}
+                for k in PerformanceIndex.model_fields.keys():
+                    if k in case_data:
+                        _params[k] = case_data[k]
+                performance_index = PerformanceIndex(**_params)
+                _fitness = self.minimum_algorithm(performance_index)
+            # 过滤无效的fitness
+            if isnan(_fitness) or isinf(_fitness):
+                continue
+            logger.debug(f"fitness {_fitness}")
+            try:
+                _target_field = self.get_target_field_from_case_data(case_data)
+            except ValueError:
+                continue
+            _pos = field_to_param(_target_field)
+            # 超过最大最小值限制的进行跳过
+            if not self.is_within_boundary(_pos, _min_bound, _max_bound):
+                continue
+            all_cost.append(_fitness)
+            all_position.append(_pos)
+        if len(all_position) != len(all_cost):
+            raise ValueError("Failed in computer_fitness.")
+        return all_position, all_cost
+
+    def op_func(self, x) -> np.ndarray:
+        n_particles = x.shape[0]
+        logger.debug(f"Acquired n_particles: {n_particles}, value: {x}")
+        generate_speed = []
+        for i in range(n_particles):
+            # 调用schedule， 获取采集的数据
+            try:
+                _res = self.scheduler.run_with_request_rate(x[i], self.target_field)
+                # 根据采集的数据，计算最优化值
+                _fitness = self.minimum_algorithm(_res)
+            except Exception as e:
+                logger.error(f"Failed. error: {e}, please check.")
+                _fitness = inf
+            logger.info(f"fitness {_fitness}")
+            self.scheduler.save_result(fitness=_fitness)
+            generate_speed.append(_fitness)
+        return np.array(generate_speed)
+
+    def constructing_bounds(self) -> Tuple[Tuple, Tuple]:
+        """
+        返回示例：((0, 10), (0, 10))
+        """
+        _min = []
+        _max = []
+        for _field in self.target_field:
+            if _field.min < _field.max:
+                _min.append(_field.min)
+                _max.append(_field.max)
+        return (tuple(_min), tuple(_max))
+
+    def dimensions(self):
+        d = 0
+        for _field in self.target_field:
+            if _field.min == _field.max:
+                continue
+            else:
+                d += 1
+        return d
+
+    def refine_optimization_candidates(self, best_results: pd.DataFrame):
+        # 分别精调每组参数
+        _record_params = [self.default_run_param]
+        _record_res = [self.default_res]
+        _record_fitness = [self.default_fitness]
+        for _, _pso_info in best_results.iterrows():
+            _target_field = self.get_target_field_from_case_data(_pso_info)
+            params = field_to_param(_target_field)
+            # 先全量运行寻优参数
+            try:
+                _res = self.scheduler.run(params, self.target_field)
+                _fitness = self.minimum_algorithm(_res)
+            except Exception as e:
+                logger.error(f"Runtime exception. error: {e}, please check.")
+                _fitness = inf
+                self.scheduler.save_result(fitness=_fitness)
+                continue
+            self.scheduler.save_result(fitness=_fitness)
+            _record_params.append(params)
+            _record_res.append(_res)
+            _record_fitness.append(_fitness)
+            if isinstance(self.scheduler.simulator, Simulator):
+                # 对寻优参数精调
+                for _ in range(self.max_fine_tune):
+                    try:
+                        simulate_run_info = self.mindie_fine_tune.mindie_fine_tune_with_cycle(params, _res)
+                    except ValueError as e:
+                        logger.error("Failed in fine-tuning parameter. error: {e}")
+                        break
+                    except StopFineTune:
+                        # 找到满足约束的最好值
+                        break
+                    params = field_to_param(simulate_run_info)
+                    # 新参数跟之前的参数没变化就提前终止了。
+                    if self.params_in_records(params, _record_params):
+                        break
+                    try:
+                        _res = self.scheduler.run(params, self.target_field)
+                        _fitness = self.minimum_algorithm(_res)
+                    except Exception as e:
+                        logger.error(f"Runtime exception. error: {e}, please check.")
+                        _fitness = inf
+                        self.scheduler.save_result(fitness=_fitness)
+                        break
+                    self.scheduler.save_result(fitness=_fitness)
+                    _record_params.append(params)
+                    _record_res.append(_res)
+                    _record_fitness.append(_fitness)
+        return _record_fitness, _record_params, _record_res
+
+    def best_params(self, fitnese_list, params_list, performance_index_list):
+        # 分析最佳参数
+        if not performance_index_list or not fitnese_list or not params_list:
+            logger.error(f"Input is empty."
+                             f"performance_index_list:{performance_index_list},"
+                             f"fitnese_list: {fitnese_list},"
+                             f"params_list: {params_list}")
+            return None, None, None
+        if len(fitnese_list) != len(params_list) != len(performance_index_list):
+            logger.error(f"The number of input elements does not match."
+                             f"performance_index_list:{len(performance_index_list)},"
+                             f"fitnese_list: {len(fitnese_list)},"
+                             f"params_list: {len(params_list)}")
+            return None, None, None
+        if self.tpot_penalty == 0 and self.ttft_penalty == 0:
+            _generate_speed = [p.generate_speed for p in performance_index_list]
+            _best_index = _generate_speed.index(max(_generate_speed))
+            return fitnese_list[_best_index], params_list[_best_index], performance_index_list[_best_index]
+        if self.ttft_penalty == 0 and self.tpot_penalty != 0:
+            _tpot_threshold = self.tpot_slo * (1 + settings.slo_coefficient)
+            if _tpot_threshold == 0:
+                return fitnese_list[0], params_list[0], performance_index_list[0]
+            _tpot_diff = [(p.time_per_output_token - _tpot_threshold) / _tpot_threshold for p in performance_index_list]
+            _tpot_lt_slo_index = [i for i, v in enumerate(_tpot_diff) if v < 0]
+            # 有满足slo的，从中选吞吐大的
+            if _tpot_lt_slo_index:
+                _best_index = 0
+                _max = 0
+                for i, v in enumerate(performance_index_list):
+                    if i not in _tpot_lt_slo_index:
+                        continue
+                    if v.generate_speed > _max:
+                        _max = v.generate_speed
+                        _best_index = i
+                return fitnese_list[_best_index], params_list[_best_index], performance_index_list[_best_index]
+            # 没有满足 slo的，选择离slo最近的约束
+            _best_index = _tpot_diff.index(min(_tpot_diff))
+            return fitnese_list[_best_index], params_list[_best_index], performance_index_list[_best_index]
+        if self.ttft_penalty != 0 and self.tpot_penalty != 0:
+            _tpot_threshold = self.tpot_slo * (1 + settings.slo_coefficient)
+            _ttft_threshold = self.ttft_slo * (1 + settings.slo_coefficient)
+            if _tpot_threshold == 0 or _ttft_threshold == 0:
+                return fitnese_list[0], params_list[0], performance_index_list[0]
+            _performance_diff = [((p.time_per_output_token - _tpot_threshold) / _tpot_threshold,
+                                  (p.time_to_first_token - _ttft_threshold) / _ttft_threshold) 
+                                  for p in performance_index_list]
+            # ttft 和 tpot 都满足条件
+            _performance_lt_slo_index = [i for i, v in enumerate(_performance_diff) if v < (0, 0)]
+            if _performance_lt_slo_index:
+                _best_index = 0
+                _max = 0
+                for i, v in enumerate(performance_index_list):
+                    if i not in _performance_lt_slo_index:
+                        continue
+                    if v.generate_speed > _max:
+                        _max = v.generate_speed
+                        _best_index = i
+                return fitnese_list[_best_index], params_list[_best_index], performance_index_list[_best_index]
+            # 没有满足slo的，选择两个差异和最小的最为最佳值。
+            _performance_diff_sum = [sum(v) for v in _performance_diff]
+            _best_index = _performance_diff_sum.index(min(_performance_diff_sum))
+            return fitnese_list[_best_index], params_list[_best_index], performance_index_list[_best_index]
+        # 未知场景，返回第一组作为最佳参数
+        return fitnese_list[0], params_list[0], performance_index_list[0]
+
+    def mindie_prepare(self, mc):
+        if mc is None:
+            return
+        if not settings.theory_guided_enable:
+            return
+        mc.avg_input_length = self.scheduler.benchmark.get_performance_metric("InputTokens")
+        mc.max_input_length = self.scheduler.benchmark.get_performance_metric("InputTokens", algorithm="max")
+        if isinstance(self.scheduler.benchmark, BenchMark):
+            mc.max_output_length = min(int(self.scheduler.benchmark.benchmark_config.command.max_output_len),
+                                       mc.max_output_length)
+        else:
+            mc.max_output_length = self.scheduler.benchmark.get_performance_metric("OutputTokens", algorithm="max")
+        logger.debug(f"avg_input_length: {mc.avg_input_length}, max_input_length: {mc.max_input_length},"
+                     f"max_output_length: {mc.max_output_length}")
+        max_batch_size_lb, max_batch_size_ub = mc.get_max_batch_size_bound()
+        if not isinf(max_batch_size_ub):
+            scale_max_batch_size_ub = int(max_batch_size_ub * settings.scaling_coefficient)
+        else:
+            scale_max_batch_size_ub = inf
+        logger.debug(f"avg_input_length: {mc.avg_input_length}, max_input_length: {mc.max_input_length},"
+                     f"max_output_length: {mc.max_output_length}")
+        max_batch_size_lb, max_batch_size_ub = mc.get_max_batch_size_bound()
+        scale_max_batch_size_ub = int(max_batch_size_ub * settings.scaling_coefficient)
+        if max_batch_size_lb >= max_batch_size_ub or max_batch_size_lb <= 0 or max_batch_size_ub <= 0:
+            logger.error(f"Theoretical derivation scope failure.max_batch_size_lb{max_batch_size_lb}, "
+                         f"max_batch_size_ub {max_batch_size_ub} ")
+            return
+        logger.debug(f"max_batch_size_lb {max_batch_size_lb}, max_batch_size_ub {max_batch_size_ub}. "
+                     f"scale_max_batch_size_ub {scale_max_batch_size_ub}")
+
+        for _field in self.target_field:
+            if _field.name == "max_batch_size":
+                # 只有在默认设置的范围内才需要压缩搜索空间
+                if _field.min < max_batch_size_lb < _field.max:
+                    _field.min = max_batch_size_lb
+                if _field.min < scale_max_batch_size_ub < _field.max:
+                    _field.max = scale_max_batch_size_ub
+                    break
+                if _field.min < max_batch_size_ub < _field.max:
+                    _field.max = max_batch_size_ub
+                break
+        logger.debug(f"target_field: {self.target_field}")
+
+    def prepare(self):
+        # 运行默认参数服务，获取理论推导需要的指标
+        mc = None
+        if is_mindie() and settings.theory_guided_enable:
+            mc = MindieModelConfig(self.scheduler.simulator.mindie_config.config_path)
+        for _, _field in enumerate(self.target_field):
+            if _field.config_position.startswith("BackendConfig"):
+                _field.value = get_required_field_from_json(self.scheduler.simulator.default_config,
+                                                            _field.config_position)
+            elif _field.config_position == "env":
+                _field.value = os.getenv(_field.name, _field.value)
+        self.default_run_param = field_to_param(self.target_field)
+        self.default_res = self.scheduler.run(self.default_run_param, self.target_field)
+        if self.default_res.generate_speed:
+            self.gen_speed_target = 10 * self.default_res.generate_speed
+        self.default_fitness = self.minimum_algorithm(self.default_res)
+        self.scheduler.save_result(fitness=self.default_fitness)
+        if self.scheduler.error_info:
+            raise ValueError(f"Failed to start the default service. "
+                             "Please check if the service and the request to start it are correct. error:{e}")
+
+        if isnan(self.default_fitness) or isinf(self.default_fitness):
+            raise ValueError(f"Failed to obtain benchmark metric data. metric {self.default_res}"
+                             "Please check if the benchmark is running successfully. ")
+        if is_mindie():
+            self.mindie_prepare(mc)
+
+    def run(self):
+        from msserviceprofiler.modelevalstate.optimizer.global_best_custom import CustomGlobalBestPSO
+        self.prepare()
+        # 备份原target field, 调整新的target field用来寻优
+        _bak_target_field = self.target_field
+        _bak_number = None
+        self.target_field = deepcopy(self.target_field)
+        for _field in self.target_field:
+            # 将并发 和 req rate 设置为固定值，不进行pso寻优
+            if _field.name in ["CONCURRENCY", "MAXCONCURRENCY"] and _field.min != _field.max:
+                _field.value = _field.min = _field.max = 1000
+            elif _field.name == "REQUESTRATE" and _field.min != _field.max:
+                _field.min = _field.max = 50
+                _field.value = None
+        # 少量请求替代全量请求
+        if settings.sample_size:
+            if (isinstance(self.scheduler.benchmark, BenchMark) and
+                    self.scheduler.benchmark.benchmark_config.command.request_count and
+                    int(self.scheduler.benchmark.benchmark_config.command.request_count) > settings.sample_size):
+                _bak_number = self.scheduler.benchmark.benchmark_config.command.request_count
+                self.scheduler.benchmark.benchmark_config.command.request_count = str(settings.sample_size)
+            if (isinstance(self.scheduler.benchmark, (VllmBenchMark, AisBench)) and
+                    self.scheduler.benchmark.benchmark_config.command.num_prompts and
+                    int(self.scheduler.benchmark.benchmark_config.command.num_prompts) > settings.sample_size):
+                _bak_number = self.scheduler.benchmark.benchmark_config.command.num_prompts
+                self.scheduler.benchmark.benchmark_config.command.num_prompts = str(settings.sample_size)
+        if self.load_history_data and self.load_breakpoint:
+            self.history_pos, self.history_cost = self.computer_fitness()
+        optimizer = CustomGlobalBestPSO(n_particles=self.n_particles, dimensions=self.dimensions(),
+                                        options=self.pso_options.model_dump(), bounds=self.constructing_bounds(),
+                                        init_pos=self.init_pos, breakpoint_pos=self.history_pos,
+                                        breakpoint_cost=self.history_cost, **self.pso_init_kwargs)
+        with enable_simulate(self.scheduler.simulator):
+            cost, joint_vars = optimizer.optimize(self.op_func, iters=self.iters)
+        best_results = self.scheduler.data_storage.get_best_result()
+        # 恢复寻优参数配置
+        self.target_field = _bak_target_field
+        if settings.sample_size and _bak_number:
+            if isinstance(self.scheduler.benchmark, BenchMark):
+                self.scheduler.benchmark.benchmark_config.command.request_count = str(_bak_number)
+            elif isinstance(self.scheduler.benchmark, (VllmBenchMark, AisBench)):
+                self.scheduler.benchmark.benchmark_config.command.num_prompts = str(_bak_number)
+        _record_fitness, _record_params, _record_res = self.refine_optimization_candidates(best_results)
+        best_fitness, best_param, best_performance_index = self.best_params(_record_fitness, _record_params,
+                                                                 _record_res)
+        if best_param is None or best_fitness is None or best_performance_index is None:
+            return
+        _position = {_field.name: _field.value for _field in map_param_with_value(best_param, self.target_field)}
+        logger.info(f"vars: {_position}, performance index: "
+                    f"ttft: {best_performance_index.time_to_first_token} \n"
+                    f"tpot: {best_performance_index.time_per_output_token} \n"
+                    f"generate_speed: {best_performance_index.generate_speed} \n")
+
+
+def main(args: argparse.Namespace):
+    from msserviceprofiler.modelevalstate.optimizer.server import main as slave_server
+    from msserviceprofiler.modelevalstate.optimizer.store import DataStorage
+    if settings.service == ServiceType.slave.value:
+        slave_server()
+        return
+
+    bak_path = None
+    if args.backup:
+        bak_path = settings.output.joinpath("bak")
+        if not bak_path.exists():
+            bak_path.mkdir(parents=True, mode=0o750)
+    if args.pd == PDPolicy.disaggregation.value:
+        target_field = settings.mindie.target_field
+        simulator = DisaggregationSimulator(settings.kubectl, bak_path=bak_path)
+    elif args.engine == EnginePolicy.mindie.value:
+        target_field = settings.mindie.target_field
+        simulator = Simulator(settings.mindie, bak_path=bak_path)
+    elif args.engine == EnginePolicy.vllm.value:
+        simulator = VllmSimulator(settings.vllm, bak_path=bak_path)
+        target_field = settings.vllm.target_field
+    else:
+        raise ValueError("No supported environment found; currently only mindie and vllm are supported. ")
+    
+    if args.benchmark_policy == BenchMarkPolicy.benchmark.value:
+        benchmark = BenchMark(settings.benchmark, bak_path=bak_path)
+    elif args.benchmark_policy == BenchMarkPolicy.vllm_benchmark.value:
+        benchmark = VllmBenchMark(settings.vllm_benchmark, bak_path=bak_path)
+    elif args.benchmark_policy == BenchMarkPolicy.profiler_benchmark.value:
+        benchmark = ProfilerBenchmark(settings.profile, benchmark_config=settings.benchmark, bak_path=bak_path,
+                                          analyze_tool=AnalyzeTool.profiler)
+    else:
+        benchmark = AisBench(settings.ais_bench, bak_path=bak_path)
+
+    # 存储结果，只在主节点存储结果
+    data_storage = DataStorage(settings.data_storage, simulator, benchmark)
+    # 初始化调度模块，支持单机和多机。
+    if args.deploy_policy == DeployPolicy.multiple.value:
+        scheduler = ScheduleWithMultiMachine(settings.communication, simulator, benchmark, data_storage,
+                                             bak_path=bak_path)
+    else:
+        scheduler = Scheduler(simulator, benchmark, data_storage, bak_path=bak_path)
+    _load_history_data = None
+    _load_history = None
+    if args.load_breakpoint:
+        _load_history = True
+    if _load_history:
+        _load_history_data = data_storage.load_history_position(settings.data_storage.store_dir,
+                                                                filter_field=data_storage.get_run_info())
+    mindie_fine_tune = MindIeFineTune(ttft_penalty=settings.ttft_penalty,
+                                      tpot_penalty=settings.tpot_penalty,
+                                      target_field=target_field,
+                                      ttft_slo=settings.ttft_slo,
+                                      tpot_slo=settings.tpot_slo,
+                                      slo_coefficient=settings.slo_coefficient)
+    pso = PSOOptimizer(scheduler,
+                       n_particles=settings.n_particles,
+                       iters=settings.iters,
+                       target_field=target_field,
+                       ttft_penalty=settings.ttft_penalty,
+                       tpot_penalty=settings.tpot_penalty,
+                       success_rate_penalty=settings.success_rate_penalty,
+                       ttft_slo=settings.ttft_slo,
+                       tpot_slo=settings.tpot_slo,
+                       success_rate_slo=settings.success_rate_slo,
+                       generate_speed_target=settings.generate_speed_target,
+                       load_history_data=_load_history_data,
+                       load_breakpoint=args.load_breakpoint,
+                       mindie_fine_tune=mindie_fine_tune,
+                       max_fine_tune=settings.max_fine_tune,
+                       pso_init_kwargs={"ftol": settings.ftol, "ftol_iter": settings.ftol_iter})
+    pso.run()
+
+
+def arg_parse(subparsers):
+    parser = subparsers.add_parser(
+        "optimizer", formatter_class=argparse.ArgumentDefaultsHelpFormatter, help="optimize for performance"
+    )
+    parser.add_argument("-lb", "--load_breakpoint", default=False, action="store_true",
+                        help="Continue from where the last optimization was aborted.")
+    parser.add_argument("-d", "--deploy_policy", default=DeployPolicy.single.value,
+                        choices=[k.value for k in list(DeployPolicy)],
+                        help="Indicates whether the multi-node running policy is used.")
+    parser.add_argument("--backup", default=False, action="store_true",
+                        help="Whether to back up data.")
+    parser.add_argument("-b", "--benchmark_policy", default=BenchMarkPolicy.ais_bench.value,
+                        choices=[k.value for k in list(BenchMarkPolicy)],
+                        help="Whether to use custom performance indicators.")
+    parser.add_argument("-e", "--engine", default=EnginePolicy.mindie.value,
+                        choices=[k.value for k in list(EnginePolicy)],
+                        help="The engine used for model evaluation.")
+    parser.add_argument("--pd", default=PDPolicy.competition.value,
+                        choices=[k.value for k in list(PDPolicy)],
+                        help="whether pd competition or pd disaggregation")
+    parser.set_defaults(func=main)

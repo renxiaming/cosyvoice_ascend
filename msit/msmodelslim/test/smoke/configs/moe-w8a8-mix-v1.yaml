@@ -1,0 +1,61 @@
+apiversion: modelslim_v1
+metadata:
+  config_id: qwen3-dense-w8a8-v1
+  score: 90
+  verified_model_types:
+    - Qwen3-32B
+    - Qwen3-14B
+    - Qwen3-8B
+  label:
+    w_bit: 8
+    a_bit: 8
+    is_sparse: False
+    kv_cache: False
+
+default_w8a8_dynamic: &default_w8a8_dynamic
+  act:
+    scope: "per_token"   # default is per_tensor
+    dtype: "int8"        # default is int8
+    symmetric: False      # default is True
+    method: "minmax"      # default is minmax
+  weight:
+    scope: "per_channel"   # default is per_channel
+    dtype: "int8"        # default is int8
+    symmetric: True       # default is True
+    method: "minmax"      # default is minmax
+
+default_w8a8: &default_w8a8
+  act:
+    scope: "per_tensor"   # default is per_tensor
+    dtype: "int8"        # default is int8
+    symmetric: False      # default is True
+    method: "minmax"      # default is minmax
+  weight:
+    scope: "per_channel"   # default is per_channel
+    dtype: "int8"        # default is int8
+    symmetric: True       # default is True
+    method: "minmax"      # default is minmax
+
+spec:
+  process:
+    - type: "group"
+      configs:
+        - type: "linear_quant"
+          qconfig: *default_w8a8
+          include:
+            - "*self_attn*"
+
+        - type: "linear_quant"
+          qconfig: *default_w8a8_dynamic
+          include:
+            - "*mlp*"
+          exclude:
+            - "*gate"
+
+  save:
+    - type: "ascendv1_saver"
+      part_file_size: 4
+      ext:
+        json_ext:
+          model_quant_type: "W8A8"
+
