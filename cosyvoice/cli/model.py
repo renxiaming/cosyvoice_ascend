@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.util
 import os
-from typing import Generator
+from typing import Generator, Optional
 import torch
 import numpy as np
 import threading
@@ -22,6 +23,15 @@ from contextlib import nullcontext
 import uuid
 from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt
+
+
+def _llm_stream_ctx(device):
+    """Avoid torch.cuda.Stream when torch_npu is present: CUDA API maps to NPU and Stream forces ACL/tbe init."""
+    if not torch.cuda.is_available():
+        return nullcontext()
+    if importlib.util.find_spec('torch_npu') is not None:
+        return nullcontext()
+    return torch.cuda.stream(torch.cuda.Stream(device))
 
 
 class CosyVoiceModel:
@@ -57,7 +67,7 @@ class CosyVoiceModel:
         # rtf and decoding related
         self.stream_scale_factor = 1
         assert self.stream_scale_factor >= 1, 'stream_scale_factor should be greater than 1, change it according to your actual rtf'
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
+        self.llm_context = _llm_stream_ctx(self.device)
         self.lock = threading.Lock()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
@@ -288,16 +298,21 @@ class CosyVoice2Model(CosyVoiceModel):
                  llm: torch.nn.Module,
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
-                 fp16: bool):
+                 fp16: bool,
+                 fp16_llm: Optional[bool] = None):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.llm = llm
         self.flow = flow
         self.hift = hift
         self.fp16 = fp16
+        if fp16_llm is None:
+            fp16_llm = fp16
+        self.fp16_llm = fp16_llm
         self.llm.fp16 = fp16
         self.flow.fp16 = fp16
         if self.fp16 is True:
-            self.llm.half()
+            if self.fp16_llm:
+                self.llm.half()
             self.flow.half()
         self.token_hop_len = 1 * self.flow.input_frame_rate #2
         # here we fix flow encoder/decoder decoding_chunk_size, in the future we will send it as arguments, or use cache
@@ -310,7 +325,7 @@ class CosyVoice2Model(CosyVoiceModel):
         self.speech_window = np.hamming(2 * self.source_cache_len)
         # rtf and decoding related
         self.stream_scale_factor = 1
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
+        self.llm_context = _llm_stream_ctx(self.device)
         self.lock = threading.Lock()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}

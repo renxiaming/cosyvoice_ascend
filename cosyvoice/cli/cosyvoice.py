@@ -128,10 +128,9 @@ class CosyVoice:
 
 class CosyVoice2(CosyVoice):
 
-    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False, load_om=False):
+    def __init__(self, model_dir, load_jit=False, load_trt=False, fp16=False, load_om=False, llm_quant_dir=None):
         self.instruct = True if '-Instruct' in model_dir else False
         self.model_dir = model_dir
-        self.fp16 = fp16
         if not os.path.exists(model_dir):
             model_dir = snapshot_download(model_dir)
         with open('{}/cosyvoice.yaml'.format(model_dir), 'r') as f:
@@ -147,10 +146,26 @@ class CosyVoice2(CosyVoice):
         if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or fp16 is True):
             load_jit, load_trt, fp16 = False, False, False
             logging.warning('no cuda device, set load_jit/load_trt/fp16 to False')
-        self.model = CosyVoice2Model(configs['llm'], configs['flow'], configs['hift'], fp16)
+        self.fp16 = fp16
+        quant_dir = llm_quant_dir if llm_quant_dir else os.environ.get('COSYVOICE_LLM_QUANT_DIR', '').strip()
+        quant_dir = quant_dir or None
+        fp16_llm = fp16 and (quant_dir is None)
+        if quant_dir is not None and fp16:
+            logging.warning(
+                'LLM W8A8 fake-quant is enabled; disabling FP16 on the LLM (flow/hift keep fp16=%s). '
+                'Set fp16=False to silence this.',
+                fp16,
+            )
+        self.model = CosyVoice2Model(configs['llm'], configs['flow'], configs['hift'], fp16, fp16_llm=fp16_llm)
         self.model.load('{}/llm.pt'.format(model_dir),
                         '{}/flow.pt'.format(model_dir),
                         '{}/hift.pt'.format(model_dir))
+        if quant_dir is not None:
+            from cosyvoice.utils.llm_quant_utils import attach_msmodelslim_fake_quant_to_qwen2lm, ensure_llm_fp32_for_quant
+
+            ensure_llm_fp32_for_quant(self.model)
+            logging.info('Attaching msmodelslim fake-quant LLM from %s', quant_dir)
+            attach_msmodelslim_fake_quant_to_qwen2lm(self.model, quant_dir)
         if load_jit:
             self.model.load_jit('{}/flow.encoder.{}.zip'.format(model_dir, 'fp16' if self.fp16 is True else 'fp32'))
         if load_trt:

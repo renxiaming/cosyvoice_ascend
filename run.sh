@@ -18,4 +18,18 @@ export CPLUS_INCLUDE_PATH=/usr/local/Ascend/ascend-toolkit/8.1.RC1/toolkit/toolc
 # 清理modelscope缓存
 rm -rf ~/.cache/modelscope/
 
-python3 infer.py --model_path=../weight/CosyVoice2-0.5B --stream
+# 与 weight 目录对齐：浮点包 + msmodelslim 量化目录
+# 终端可覆盖，例如：export MODEL_ROOT=/home/ma-user/work/test/model/weight
+MODEL_ROOT="${MODEL_ROOT:-../weight}"
+
+# 设 USE_LLM_QUANT=0 可对比浮点 Qwen（不挂 --llm_quant_dir）
+USE_LLM_QUANT="${USE_LLM_QUANT:-1}"
+QUANT_ARGS=()
+if [ "${USE_LLM_QUANT}" != "0" ]; then
+  QUANT_ARGS+=(--llm_quant_dir="${MODEL_ROOT}/CosyVoice2-0.5B-w8a8_quant")
+fi
+
+python3 infer.py \
+  --model_path="${MODEL_ROOT}/CosyVoice2-0.5B" \
+  "${QUANT_ARGS[@]}" \
+  --stream

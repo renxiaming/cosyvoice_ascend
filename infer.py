@@ -24,14 +24,27 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description="CosyVoice infer")
     parser.add_argument("--model_path", type=str, help="model path")
+    parser.add_argument(
+        "--llm_quant_dir",
+        type=str,
+        default=None,
+        help="msmodelslim 量化产出目录（含 quant_model_description.json 与 *.safetensors）；不设则走浮点 Qwen",
+    )
     parser.add_argument('--warm_up_times', default=2, type=int, help='warm up times')
     parser.add_argument('--infer_count', default=20, type=int, help='infer loop count')
     parser.add_argument('--stream', action="store_true", help='stream infer')
     args = parser.parse_args()
 
-    cosyvoice = CosyVoice2(args.model_path, load_om=True, fp16=True)
+    cosyvoice = CosyVoice2(
+        args.model_path,
+        load_om=True,
+        fp16=True,
+        llm_quant_dir=args.llm_quant_dir,
+    )
     cosyvoice.model.llm.eval()
-    cosyvoice.model.llm.llm.model.model.half()
+    # 量化 LLM 为假量化算子，不能再对 backbone 做 .half()
+    if args.llm_quant_dir is None:
+        cosyvoice.model.llm.llm.model.model.half()
 
     # 对hift模型结构进行torchair图模式适配
     cosyvoice.model.hift.remove_weight_norm() #删除推理过程中的weight_norm
