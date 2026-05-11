@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: msmodelslim
+Version: 7.0.0rc912
+Summary: msModelSlim, MindStudio ModelSlim Tools
+Home-page: https://gitee.com/ascend/msit
+License: Apache-2.0
+Keywords: msmodelslim
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+Requires-Dist: easydict==1.13
+Requires-Dist: einops
+Requires-Dist: pydantic>=2.0.3
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

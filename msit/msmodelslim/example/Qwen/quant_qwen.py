@@ -8,8 +8,9 @@ import torch.nn.functional as F
 current_directory = os.path.dirname(os.path.abspath(__file__))
 parent_directory = os.path.abspath(os.path.join(current_directory, '..', ".."))
 sys.path.append(parent_directory)
-print(parent_directory)
-print(current_directory)
+# sys.path.insert(0,parent_directory)
+# print(parent_directory)
+# print(current_directory)
 from example.common.security.path import get_valid_write_path, get_valid_read_path, get_write_directory
 from example.common.utils import SafeGenerator, ArgumentParser, StringArgumentValidator, MAX_KEY_LENGTH, \
     MAX_JSON_LENGTH, cmd_bool, parse_tokenizer_args
