@@ -162,7 +162,12 @@ class CosyVoice2(CosyVoice):
             system = platform.system().lower()
             flow_om = InferSession(0, '{}/flow_{}_{}.om'.format(model_dir, system ,arch))
             flow_om_static = InferSession(0, '{}/flow_static.om'.format(model_dir))
+
+            
             speech_om = InferSession(0, '{}/speech_{}_{}.om'.format(model_dir, system ,arch))
+            # speech_om_path="/home/ma-user/work/test/model/weight/om/fp16_dynamic50"#xmren临时增加path
+            # speech_om = InferSession(0, '{}/speech_{}_{}.om'.format(speech_om_path, system ,arch))
+            
             self.frontend.speech_om = speech_om
             self.frontend.flow_om = flow_om
             self.model.flow.decoder.flow_om_static = flow_om_static
